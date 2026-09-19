@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const obsidian_1 = require("obsidian");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const crypto_1 = require("node:crypto");
 const DEFAULT_SETTINGS = {
     steamNotesPath: '',
     destinationFolder: 'Steam/Notes',
@@ -10,12 +11,18 @@ const DEFAULT_SETTINGS = {
     importAllSteamImages: true,
     importRawFiles: true,
     resolveGameNames: true,
+    globalTags: '',
+    autoSyncOnStartup: true,
+    autoSyncIntervalMinutes: 0
 };
 class SteamyNotesPlugin extends obsidian_1.Plugin {
     constructor() {
         super(...arguments);
         this.settings = DEFAULT_SETTINGS;
         this.metadataCache = {};
+        this.imageCache = {};
+        this.syncState = {};
+        this.syncInProgress = false;
     }
     async onload() {
         await this.loadSettings();
@@ -33,34 +40,54 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
         // writing anything. Push is disabled until two-way sync is implemented.
         this.addRibbonIcon('book-open', 'SteamyNotes: Steam notes actions', () => this.openSyncActions());
         this.addSettingTab(new SteamyNotesSettingTab(this.app, this));
+        this.app.workspace.onLayoutReady(() => {
+            if (this.settings.autoSyncOnStartup)
+                void this.importSteamNotes({ automatic: true });
+            this.configureSyncInterval();
+        });
+    }
+    onunload() {
+        if (this.syncIntervalId !== undefined)
+            window.clearInterval(this.syncIntervalId);
     }
     openSyncActions() {
         new SyncActionsModal(this.app, this).open();
     }
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-        this.metadataCache = (await this.loadData())?.metadataCache ?? {};
+        const data = await this.loadData();
+        this.metadataCache = data?.metadataCache ?? {};
+        this.imageCache = data?.imageCache ?? {};
+        this.syncState = data?.syncState ?? {};
     }
     async saveSettings() {
-        await this.saveData({ ...this.settings, metadataCache: this.metadataCache });
+        await this.saveData({ ...this.settings, metadataCache: this.metadataCache, imageCache: this.imageCache, syncState: this.syncState });
     }
-    async importSteamNotes() {
+    async importSteamNotes(options = {}) {
+        if (this.syncInProgress)
+            return;
         const source = this.settings.steamNotesPath.trim();
         if (!source) {
-            new obsidian_1.Notice('SteamyNotes: set the Steam Game Notes folder in Settings first.');
+            if (!options.automatic)
+                new obsidian_1.Notice('SteamyNotes: set the Steam Game Notes folder in Settings first.');
             return;
         }
+        this.syncInProgress = true;
         try {
             const files = await this.findSteamNoteFiles(source);
             if (!files.length) {
-                new obsidian_1.Notice('SteamyNotes: no notes_<gameid> files were found in that folder.');
+                if (!options.automatic)
+                    new obsidian_1.Notice('SteamyNotes: no notes_<gameid> files were found in that folder.');
                 return;
             }
             let imported = 0;
             let failed = 0;
+            let skipped = 0;
             for (const steamFile of files) {
                 try {
-                    imported += await this.importSteamFile(steamFile);
+                    const result = await this.importSteamFile(steamFile);
+                    imported += result.imported;
+                    skipped += result.skipped;
                 }
                 catch (error) {
                     failed++;
@@ -68,13 +95,20 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
                 }
             }
             await this.saveSettings();
-            new obsidian_1.Notice(`SteamyNotes: imported ${imported} note${imported === 1 ? '' : 's'} from ${files.length} Steam file${files.length === 1 ? '' : 's'}${failed ? ` (${failed} failed)` : ''}.`);
+            if (!options.automatic) {
+                new obsidian_1.Notice(`SteamyNotes: imported ${imported} note${imported === 1 ? '' : 's'}${skipped ? `, protected ${skipped}` : ''} from ${files.length} Steam file${files.length === 1 ? '' : 's'}${failed ? ` (${failed} failed)` : ''}.`);
+            }
         }
         catch (error) {
             console.error('SteamyNotes scan failed', error);
-            new obsidian_1.Notice(`SteamyNotes: unable to scan Steam notes folder. ${String(error)}`);
+            if (!options.automatic)
+                new obsidian_1.Notice(`SteamyNotes: unable to scan Steam notes folder. ${String(error)}`);
+        }
+        finally {
+            this.syncInProgress = false;
         }
     }
+
     async findSteamNoteFiles(source) {
         const entries = await fs.readdir(source, { withFileTypes: true });
         const result = [];
@@ -89,33 +123,73 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
     }
     async importSteamFile(steamFile) {
         const raw = await fs.readFile(steamFile.filePath, 'utf8');
+        const sourceHash = (0, crypto_1.createHash)('sha1').update(raw).digest('hex');
+        const previous = this.syncState[steamFile.appId];
+        if (previous?.sourceHash === sourceHash)
+            return { imported: 0, skipped: 0 };
         const gameName = this.settings.resolveGameNames
             ? await this.getGameName(steamFile.appId)
             : `Steam App ${steamFile.appId}`;
         const folder = (0, obsidian_1.normalizePath)(`${this.settings.destinationFolder ? `${this.settings.destinationFolder}/` : ''}${sanitizePathPart(gameName)}`);
         await this.ensureVaultFolder(folder);
         const parsed = parseSteamNotes(raw);
+        const blankSteamCopy = !raw.trim() || isEmptySteamNotesPayload(raw);
+        const shrank = !!previous && parsed.length < previous.noteCount;
+        if (blankSteamCopy || shrank) {
+            const reason = blankSteamCopy ? 'Steam returned a blank notes file' : `Steam notes dropped from ${previous.noteCount} to ${parsed.length}`;
+            new obsidian_1.Notice(`SteamyNotes: ${gameName} was not imported because ${reason}. Your existing Obsidian notes were left untouched.`);
+            return { imported: 0, skipped: previous?.noteCount ?? 0 };
+        }
         const imageRoot = path.join(path.dirname(steamFile.filePath), `notes_${steamFile.appId}_images`);
         const imageDestination = this.settings.imageDestinationFolder.trim()
             ? (0, obsidian_1.normalizePath)(this.settings.imageDestinationFolder.trim())
             : folder;
         await this.ensureVaultFolder(imageDestination);
-        const imageMap = await this.importSteamImages(imageRoot, imageDestination, parsed);
+        const imageMap = await this.importSteamImages(imageRoot, imageDestination, parsed, gameName);
         let count = 0;
         for (const note of parsed) {
             const fileName = sanitizePathPart(note.title || `Steam Note ${note.index}`);
             const target = (0, obsidian_1.normalizePath)(`${folder}/${String(note.index).padStart(2, '0')} - ${fileName}.md`);
-            const markdown = buildMarkdown(gameName, steamFile.appId, steamFile.filePath, note, imageMap);
-            await this.writeVaultFile(target, markdown);
-            count++;
+            const markdown = buildMarkdown(gameName, steamFile.appId, steamFile.filePath, note, imageMap, this.settings.globalTags);
+            const existing = this.app.vault.getAbstractFileByPath(target);
+            if (existing && 'path' in existing) {
+                const current = await this.app.vault.read(existing);
+                if (current !== markdown) {
+                    await this.createSnapshot(folder, target, current);
+                    await this.writeVaultFile(target, markdown);
+                    count++;
+                }
+            }
+            else {
+                await this.writeVaultFile(target, markdown);
+                count++;
+            }
         }
         if (this.settings.importRawFiles) {
             const rawName = `.steam-source-${steamFile.appId}.txt`;
             await this.writeVaultFile((0, obsidian_1.normalizePath)(`${folder}/${rawName}`), raw);
         }
-        return count;
+        this.syncState[steamFile.appId] = { sourceHash, noteCount: parsed.length, syncedAt: new Date().toISOString() };
+        return { imported: count, skipped: 0 };
     }
-    async importSteamImages(imageRoot, imageDestination, notes) {
+    async createSnapshot(gameFolder, target, content) {
+        const historyFolder = (0, obsidian_1.normalizePath)(`${gameFolder}/History`);
+        await this.ensureVaultFolder(historyFolder);
+        const base = path.posix.basename(target, '.md');
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const snapshot = (0, obsidian_1.normalizePath)(`${historyFolder}/${sanitizePathPart(base)} - ${stamp}.md`);
+        await this.app.vault.create(snapshot, content);
+    }
+    configureSyncInterval() {
+        if (this.syncIntervalId !== undefined)
+            window.clearInterval(this.syncIntervalId);
+        const minutes = Number(this.settings.autoSyncIntervalMinutes);
+        if (Number.isFinite(minutes) && minutes > 0) {
+            this.syncIntervalId = window.setInterval(() => void this.importSteamNotes({ automatic: true }), minutes * 60 * 1000);
+        }
+    }
+
+    async importSteamImages(imageRoot, imageDestination, notes, gameName) {
         const result = new Map();
         let entries;
         try {
@@ -124,16 +198,46 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
         catch (_) {
             return result;
         }
-        const referenced = new Set(notes.flatMap(note => extractSteamImageRefs(note.body).map(ref => ref.filename)));
+        const imageInfo = new Map();
+        let unreferencedNumber = 0;
+        for (const note of notes) {
+            let noteImageNumber = 0;
+            for (const ref of extractSteamImageRefs(note.body)) {
+                noteImageNumber++;
+                if (!imageInfo.has(ref.filename)) {
+                    imageInfo.set(ref.filename, { title: note.title || `Steam Note ${note.index}`, number: noteImageNumber });
+                }
+            }
+        }
+        const referenced = new Set(imageInfo.keys());
+        const usedTargets = new Set();
         for (const entry of entries) {
             if (!entry.isFile())
                 continue;
             if (!this.settings.importAllSteamImages && !referenced.has(entry.name))
                 continue;
             const source = path.join(imageRoot, entry.name);
-            const target = (0, obsidian_1.normalizePath)(`${imageDestination}/${sanitizePathPart(entry.name)}`);
             try {
                 const bytes = await fs.readFile(source);
+                const cacheKey = `${steamAppIdForImageRoot(imageRoot)}:${entry.name}`;
+                let target = this.imageCache[cacheKey];
+                if (target && !target.startsWith(`${imageDestination}/`) && target !== imageDestination) {
+                    target = '';
+                }
+                if (!target) {
+                    const info = imageInfo.get(entry.name);
+                    let baseName;
+                    if (info) {
+                        baseName = `${sanitizePathPart(gameName)} - ${sanitizePathPart(info.title)} - Image ${String(info.number).padStart(2, '0')}`;
+                    }
+                    else {
+                        unreferencedNumber++;
+                        baseName = `${sanitizePathPart(gameName)} - Unreferenced Image ${String(unreferencedNumber).padStart(2, '0')}`;
+                    }
+                    target = await this.uniqueImageTarget(imageDestination, baseName, path.extname(entry.name), usedTargets);
+                    this.imageCache[cacheKey] = target;
+                }
+                usedTargets.add(target);
                 await this.writeVaultBinary(target, bytes);
                 result.set(entry.name, target);
             }
@@ -142,6 +246,24 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
             }
         }
         return result;
+    }
+
+    async uniqueImageTarget(destination, baseName, extension, usedTargets) {
+        let number = 1;
+        while (true) {
+            const suffix = number === 1 ? '' : ` ${number}`;
+            const target = (0, obsidian_1.normalizePath)(destination ? `${destination}/${baseName}${suffix}${extension}` : `${baseName}${suffix}${extension}`);
+            if (usedTargets.has(target)) {
+                number++;
+                continue;
+            }
+            const existing = this.app.vault.getAbstractFileByPath(target);
+            if (!existing)
+                return target;
+            if (Object.values(this.imageCache).includes(target))
+                return target;
+            number++;
+        }
     }
 
     async getGameName(appId) {
@@ -194,11 +316,36 @@ exports.default = SteamyNotesPlugin;
 function sanitizePathPart(value) {
     return value.replace(/[\\/:*?"<>|]/g, '-').replace(/[. ]+$/, '').trim() || 'Untitled';
 }
-function buildMarkdown(gameName, appId, sourcePath, note, imageMap) {
+function steamAppIdForImageRoot(imageRoot) {
+    const match = /notes_(\d+)_images$/.exec(imageRoot.replace(/\\/g, '/'));
+    return match?.[1] ?? 'unknown';
+}
+function buildMarkdown(gameName, appId, sourcePath, note, imageMap, globalTags) {
     const body = steamBodyToMarkdown(note.body, imageMap);
     const created = note.timeCreated ? new Date(note.timeCreated * 1000).toISOString() : '';
     const modified = note.timeModified ? new Date(note.timeModified * 1000).toISOString() : '';
-    return `---\nsteam_appid: ${appId}\nsteam_game: ${yamlQuote(gameName)}\nsteam_source: ${yamlQuote(sourcePath)}\nsteam_note_id: ${yamlQuote(note.id)}\nsteam_note_index: ${note.index}\n${created ? `steam_created: ${created}\n` : ''}${modified ? `steam_modified: ${modified}\n` : ''}---\n\n# ${note.title || `Steam Note ${note.index}`}\n\n${body.trim()}\n`;
+    const tags = parseGlobalTags(globalTags);
+    const tagsFrontmatter = tags.length ? `tags:
+${tags.map((tag) => `  - ${yamlQuote(tag)}`).join('\n')}
+` : '';
+    return `---
+${tagsFrontmatter}steam_appid: ${appId}
+steam_game: ${yamlQuote(gameName)}
+steam_source: ${yamlQuote(sourcePath)}
+steam_note_id: ${yamlQuote(note.id)}
+steam_note_index: ${note.index}
+${created ? `steam_created: ${created}
+` : ''}${modified ? `steam_modified: ${modified}
+` : ''}---
+
+# ${note.title || `Steam Note ${note.index}`}
+
+${body.trim()}
+`;
+}
+
+function parseGlobalTags(value) {
+    return value.split(/[\n,]+/).map((tag) => tag.trim().replace(/^#+/, '')).filter(Boolean);
 }
 
 function yamlQuote(value) {
@@ -209,6 +356,16 @@ function yamlQuote(value) {
  * current format is not a documented public Steam API. We first try JSON, then
  * a small Valve-KeyValues parser, then fall back to preserving the raw text.
  */
+function isEmptySteamNotesPayload(raw) {
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed?.notes) && parsed.notes.length === 0;
+    }
+    catch (_) {
+        return false;
+    }
+}
+
 function parseSteamNotes(raw) {
     const text = raw.replace(/^\uFEFF/, '').replace(/\0/g, '');
     try {
@@ -585,6 +742,31 @@ class SteamyNotesSettingTab extends obsidian_1.PluginSettingTab {
             .addToggle(toggle => toggle
             .setValue(this.plugin.settings.importAllSteamImages)
             .onChange(async (value) => { this.plugin.settings.importAllSteamImages = value; await this.plugin.saveSettings(); }));
+        new obsidian_1.Setting(containerEl)
+            .setName('Custom global tags')
+            .setDesc('Optional tags added to the existing frontmatter of every imported Steam note. Enter multiple tags separated by commas. A leading # is optional; for example: steamnotes, games, #steam')
+            .addText((text) => text
+            .setPlaceholder('steamnotes')
+            .setValue(this.plugin.settings.globalTags)
+            .onChange(async (value) => { this.plugin.settings.globalTags = value; await this.plugin.saveSettings(); }));
+        new obsidian_1.Setting(containerEl)
+            .setName('Sync automatically on startup')
+            .setDesc('Check Steam Game Notes when Obsidian finishes loading. Steam files are only read; Push is still disabled.')
+            .addToggle(toggle => toggle
+            .setValue(this.plugin.settings.autoSyncOnStartup)
+            .onChange(async (value) => { this.plugin.settings.autoSyncOnStartup = value; await this.plugin.saveSettings(); }));
+        new obsidian_1.Setting(containerEl)
+            .setName('Automatic sync interval (minutes)')
+            .setDesc('Set to 0 to disable. For example, 15 checks every 15 minutes. Changes are detected by a SHA-1 hash of each Steam notes file.')
+            .addText(text => text
+            .setPlaceholder('0')
+            .setValue(String(this.plugin.settings.autoSyncIntervalMinutes))
+            .onChange(async (value) => {
+            const minutes = Math.max(0, Math.floor(Number(value) || 0));
+            this.plugin.settings.autoSyncIntervalMinutes = minutes;
+            await this.plugin.saveSettings();
+            this.plugin.configureSyncInterval();
+        }));
         new obsidian_1.Setting(containerEl)
             .setName('Resolve game names')
             .setDesc('Use Steam AppID metadata to name Obsidian folders. The AppID remains in frontmatter, so folder renaming does not change the Steam identity.')
