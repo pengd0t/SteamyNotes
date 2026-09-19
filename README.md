@@ -4,7 +4,7 @@ Bring the notes you take in Steam's in-game overlay into Obsidian. Organized by 
 ## Description
 SteamyNotes is an Obsidian plugin that pulls your Steam Overlay game notes (the ones you write with Shift+Tab → Notes while playing) into your vault as Markdown files, one folder per game.
 
-Status: early prototype (v0.3.1). Pulling notes and their attached images works. Pushing edits back to Steam is not available yet, so SteamyNotes only reads your Steam notes and never modifies them.
+Status: early prototype (v0.5.0). Pulling notes and their attached images works. Pushing edits back to Steam is not available yet, so SteamyNotes only reads your Steam notes and never modifies them.
 
 Requires: Obsidian 1.7.2 or newer · Desktop only · Steam installed on the same computer
 
