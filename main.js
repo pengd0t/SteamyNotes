@@ -6,6 +6,8 @@ const path = require("node:path");
 const DEFAULT_SETTINGS = {
     steamNotesPath: '',
     destinationFolder: 'Steam/Notes',
+    imageDestinationFolder: 'Steam/Notes/Images',
+    importAllSteamImages: true,
     importRawFiles: true,
     resolveGameNames: true,
 };
@@ -93,11 +95,17 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
         const folder = (0, obsidian_1.normalizePath)(`${this.settings.destinationFolder ? `${this.settings.destinationFolder}/` : ''}${sanitizePathPart(gameName)}`);
         await this.ensureVaultFolder(folder);
         const parsed = parseSteamNotes(raw);
+        const imageRoot = path.join(path.dirname(steamFile.filePath), `notes_${steamFile.appId}_images`);
+        const imageDestination = this.settings.imageDestinationFolder.trim()
+            ? (0, obsidian_1.normalizePath)(this.settings.imageDestinationFolder.trim())
+            : folder;
+        await this.ensureVaultFolder(imageDestination);
+        const imageMap = await this.importSteamImages(imageRoot, imageDestination, parsed);
         let count = 0;
         for (const note of parsed) {
             const fileName = sanitizePathPart(note.title || `Steam Note ${note.index}`);
             const target = (0, obsidian_1.normalizePath)(`${folder}/${String(note.index).padStart(2, '0')} - ${fileName}.md`);
-            const markdown = buildMarkdown(gameName, steamFile.appId, steamFile.filePath, note);
+            const markdown = buildMarkdown(gameName, steamFile.appId, steamFile.filePath, note, imageMap);
             await this.writeVaultFile(target, markdown);
             count++;
         }
@@ -107,6 +115,35 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
         }
         return count;
     }
+    async importSteamImages(imageRoot, imageDestination, notes) {
+        const result = new Map();
+        let entries;
+        try {
+            entries = await fs.readdir(imageRoot, { withFileTypes: true });
+        }
+        catch (_) {
+            return result;
+        }
+        const referenced = new Set(notes.flatMap(note => extractSteamImageRefs(note.body).map(ref => ref.filename)));
+        for (const entry of entries) {
+            if (!entry.isFile())
+                continue;
+            if (!this.settings.importAllSteamImages && !referenced.has(entry.name))
+                continue;
+            const source = path.join(imageRoot, entry.name);
+            const target = (0, obsidian_1.normalizePath)(`${imageDestination}/${sanitizePathPart(entry.name)}`);
+            try {
+                const bytes = await fs.readFile(source);
+                await this.writeVaultBinary(target, bytes);
+                result.set(entry.name, target);
+            }
+            catch (error) {
+                console.warn('SteamyNotes: unable to import image', source, error);
+            }
+        }
+        return result;
+    }
+
     async getGameName(appId) {
         if (this.metadataCache[appId]?.name)
             return this.metadataCache[appId].name;
@@ -143,14 +180,27 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
             await this.app.vault.create(filePath, content);
         }
     }
+    async writeVaultBinary(filePath, data) {
+        const existing = this.app.vault.getAbstractFileByPath(filePath);
+        if (existing && 'path' in existing) {
+            await this.app.vault.adapter.writeBinary(filePath, data);
+        }
+        else {
+            await this.app.vault.createBinary(filePath, data);
+        }
+    }
 }
 exports.default = SteamyNotesPlugin;
 function sanitizePathPart(value) {
     return value.replace(/[\\/:*?"<>|]/g, '-').replace(/[. ]+$/, '').trim() || 'Untitled';
 }
-function buildMarkdown(gameName, appId, sourcePath, note) {
-    return `---\nsteam_appid: ${appId}\nsteam_game: ${yamlQuote(gameName)}\nsteam_source: ${yamlQuote(sourcePath)}\nsteam_note_index: ${note.index}\n---\n\n# ${note.title || `Steam Note ${note.index}`}\n\n${note.body.trim()}\n`;
+function buildMarkdown(gameName, appId, sourcePath, note, imageMap) {
+    const body = steamBodyToMarkdown(note.body, imageMap);
+    const created = note.timeCreated ? new Date(note.timeCreated * 1000).toISOString() : '';
+    const modified = note.timeModified ? new Date(note.timeModified * 1000).toISOString() : '';
+    return `---\nsteam_appid: ${appId}\nsteam_game: ${yamlQuote(gameName)}\nsteam_source: ${yamlQuote(sourcePath)}\nsteam_note_id: ${yamlQuote(note.id)}\nsteam_note_index: ${note.index}\n${created ? `steam_created: ${created}\n` : ''}${modified ? `steam_modified: ${modified}\n` : ''}---\n\n# ${note.title || `Steam Note ${note.index}`}\n\n${body.trim()}\n`;
 }
+
 function yamlQuote(value) {
     return JSON.stringify(value);
 }
@@ -183,51 +233,59 @@ function parseSteamNotes(raw) {
 }
 function extractNotes(value) {
     const found = [];
-    const seen = new Set();
-    let index = 0;
-    const visit = (node) => {
-        if (!node || typeof node !== 'object')
+    if (!value || typeof value !== 'object')
+        return found;
+    const root = value;
+    const rawNotes = Array.isArray(root.notes) ? root.notes : [];
+    rawNotes.forEach((raw, index) => {
+        if (!raw || typeof raw !== 'object')
             return;
-        if (Array.isArray(node)) {
-            for (const item of node)
-                visit(item);
-            return;
-        }
-        const obj = node;
-        const keys = Object.keys(obj);
-        const lower = new Map(keys.map(k => [k.toLowerCase(), k]));
-        const bodyKey = ['content', 'text', 'body', 'note', 'markdown', 'html'].map(k => lower.get(k)).find(Boolean);
-        if (bodyKey && typeof obj[bodyKey] === 'string') {
-            const titleKey = ['title', 'name', 'subject'].map(k => lower.get(k)).find(Boolean);
-            const body = String(obj[bodyKey]);
-            const title = titleKey && typeof obj[titleKey] === 'string' ? String(obj[titleKey]) : `Steam Note ${index + 1}`;
-            const signature = `${title}\n${body}`;
-            if (!seen.has(signature)) {
-                seen.add(signature);
-                found.push({ title, body: htmlToMarkdown(body), index: ++index });
-            }
-        }
-        for (const key of keys)
-            visit(obj[key]);
-    };
-    visit(value);
+        const obj = raw;
+        const content = typeof obj.content === 'string' ? obj.content : '';
+        const title = typeof obj.title === 'string' ? obj.title : `Steam Note ${index + 1}`;
+        found.push({
+            id: typeof obj.id === 'string' ? obj.id : `index-${index + 1}`,
+            title,
+            body: content,
+            index: index + 1,
+            ordinal: typeof obj.ordinal === 'number' ? obj.ordinal : undefined,
+            timeCreated: typeof obj.time_created === 'number' ? obj.time_created : undefined,
+            timeModified: typeof obj.time_modified === 'number' ? obj.time_modified : undefined,
+        });
+    });
     return found;
+}
+function extractSteamImageRefs(value) {
+    const refs = [];
+    const regex = /\[cloudimg\s+src="([^"]+)"\]\[\/cloudimg\]/gi;
+    let match;
+    while ((match = regex.exec(value)) !== null) {
+        const src = match[1].replace(/\\/g, '/');
+        refs.push({ src, filename: path.posix.basename(src) });
+    }
+    return refs;
+}
+function steamBodyToMarkdown(value, imageMap) {
+    let body = value;
+    body = body.replace(/\[cloudimg\s+src="([^"]+)"\]\[\/cloudimg\]/gi, (_m, src) => {
+        const filename = path.posix.basename(src.replace(/\\/g, '/'));
+        const vaultPath = imageMap.get(filename);
+        return vaultPath ? `![[${vaultPath}]]` : `<!-- Steam image not imported: ${filename} -->`;
+    });
+    return htmlToMarkdown(body);
 }
 function htmlToMarkdown(value) {
     return value
-        // Steam Game Notes currently uses [p]...[/p] for hard paragraph breaks.
-        // Keep Obsidian clean; a future serializer can convert Markdown paragraphs
-        // back to Steam markup when push is implemented.
         .replace(/\[p\]/gi, '')
         .replace(/\[\/p\]/gi, '\n\n')
         .replace(/\[br\]/gi, '\n')
         .replace(/\[b\](.*?)\[\/b\]/gis, '**$1**')
         .replace(/\[i\](.*?)\[\/i\]/gis, '*$1*')
+        .replace(/<br\s*\/?>(?=\S)/gi, '\n')
         .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<\/p>\s*<p>/gi, '\n\n')
         .replace(/<\/?p>/gi, '')
-        .replace(/<strong>(.*?)<\/strong>/gi, '**$1**')
-        .replace(/<em>(.*?)<\/em>/gi, '*$1*')
+        .replace(/<strong>(.*?)<\/strong>/gis, '**$1**')
+        .replace(/<em>(.*?)<\/em>/gis, '*$1*')
         .replace(/<[^>]+>/g, '')
         .replace(/&nbsp;/g, ' ')
         .replace(/&amp;/g, '&')
@@ -236,6 +294,7 @@ function htmlToMarkdown(value) {
         .replace(/\n{3,}/g, '\n\n')
         .trim();
 }
+
 function parseValveKeyValues(text) {
     let i = 0;
     const len = text.length;
@@ -485,6 +544,38 @@ class SteamyNotesSettingTab extends obsidian_1.PluginSettingTab {
             await this.plugin.saveSettings();
             this.display();
         }));
+        const imageSetting = new obsidian_1.Setting(containerEl)
+            .setName('Steam note image destination')
+            .setDesc('Steam stores pasted note images in notes_<gameid>_images. By default SteamyNotes copies them into Steam/Notes/Images and embeds them in imported notes.');
+        imageSetting.addButton(button => button
+            .setButtonText(this.plugin.settings.imageDestinationFolder || 'Vault root')
+            .onClick(() => {
+            const folders = getVaultFolders(this.plugin.app);
+            new FolderPickerModal(this.plugin.app, folders, async (folder) => {
+                this.plugin.settings.imageDestinationFolder = folder;
+                await this.plugin.saveSettings();
+                this.display();
+            }).open();
+        }));
+        imageSetting.addButton(button => button
+            .setButtonText('Obsidian attachment folder')
+            .onClick(async () => {
+            const configured = this.plugin.app.vault.getConfig?.('attachmentFolderPath');
+            if (typeof configured === 'string' && configured) {
+                this.plugin.settings.imageDestinationFolder = configured;
+                await this.plugin.saveSettings();
+                this.display();
+            }
+            else {
+                new obsidian_1.Notice('SteamyNotes: Obsidian did not expose a configured attachment folder.');
+            }
+        }));
+        new obsidian_1.Setting(containerEl)
+            .setName('Import all Steam note images')
+            .setDesc("Copy every image in each game's notes_<gameid>_images folder, including images no longer referenced by a note. Disable to copy only images referenced by imported notes.")
+            .addToggle(toggle => toggle
+            .setValue(this.plugin.settings.importAllSteamImages)
+            .onChange(async (value) => { this.plugin.settings.importAllSteamImages = value; await this.plugin.saveSettings(); }));
         new obsidian_1.Setting(containerEl)
             .setName('Resolve game names')
             .setDesc('Use Steam AppID metadata to name Obsidian folders. The AppID remains in frontmatter, so folder renaming does not change the Steam identity.')
