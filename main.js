@@ -570,6 +570,15 @@ class SteamyNotesSettingTab extends obsidian_1.PluginSettingTab {
                 new obsidian_1.Notice('SteamyNotes: Obsidian did not expose a configured attachment folder.');
             }
         }));
+        imageSetting.addButton(button => button
+            .setButtonText('New folder…')
+            .onClick(() => {
+            new NewFolderModal(this.plugin.app, this.plugin, async (folder) => {
+                this.plugin.settings.imageDestinationFolder = folder;
+                await this.plugin.saveSettings();
+                this.display();
+            }).open();
+        }));
         new obsidian_1.Setting(containerEl)
             .setName('Import all Steam note images')
             .setDesc("Copy every image in each game's notes_<gameid>_images folder, including images no longer referenced by a note. Disable to copy only images referenced by imported notes.")
