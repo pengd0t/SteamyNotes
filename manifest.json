@@ -1,0 +1,10 @@
+{
+  "id": "steamynotes",
+  "name": "SteamyNotes",
+  "version": "0.1.0",
+  "minAppVersion": "1.7.2",
+  "description": "Import Steam Overlay Game Notes into Obsidian, organized by game.",
+  "author": "pengd0t",
+  "authorUrl": "https://github.com/pengd0t",
+  "isDesktopOnly": true
+}

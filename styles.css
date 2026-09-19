@@ -1,0 +1,2 @@
+.steamynotes-setting-note { color: var(--text-muted); font-size: var(--font-ui-small); }
+.steamynotes-status { margin-top: 1em; padding: 0.75em; border: 1px solid var(--background-modifier-border); border-radius: var(--radius-s); }
