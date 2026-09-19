@@ -1,41 +1,8 @@
 "use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 Object.defineProperty(exports, "__esModule", { value: true });
 const obsidian_1 = require("obsidian");
-const fs = __importStar(require("node:fs/promises"));
-const path = __importStar(require("node:path"));
+const fs = require("node:fs/promises");
+const path = require("node:path");
 const DEFAULT_SETTINGS = {
     steamNotesPath: '',
     destinationFolder: 'Steam/Notes',
@@ -51,17 +18,26 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
     async onload() {
         await this.loadSettings();
         this.addCommand({
-            id: 'import-steam-notes',
-            name: 'Import Steam notes',
+            id: 'open-sync-actions',
+            name: 'Open Steam notes actions',
+            callback: () => this.openSyncActions(),
+        });
+        this.addCommand({
+            id: 'pull-steam-notes',
+            name: 'Pull Steam notes into Obsidian',
             callback: () => void this.importSteamNotes(),
         });
-        this.addRibbonIcon('book-open', 'Import Steam notes', () => void this.importSteamNotes());
+        // The ribbon deliberately opens an action chooser rather than immediately
+        // writing anything. Push is disabled until two-way sync is implemented.
+        this.addRibbonIcon('book-open', 'SteamyNotes: Steam notes actions', () => this.openSyncActions());
         this.addSettingTab(new SteamyNotesSettingTab(this.app, this));
     }
+    openSyncActions() {
+        new SyncActionsModal(this.app, this).open();
+    }
     async loadSettings() {
-        var _a, _b;
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-        this.metadataCache = (_b = (_a = (await this.loadData())) === null || _a === void 0 ? void 0 : _a.metadataCache) !== null && _b !== void 0 ? _b : {};
+        this.metadataCache = (await this.loadData())?.metadataCache ?? {};
     }
     async saveSettings() {
         await this.saveData({ ...this.settings, metadataCache: this.metadataCache });
@@ -114,7 +90,7 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
         const gameName = this.settings.resolveGameNames
             ? await this.getGameName(steamFile.appId)
             : `Steam App ${steamFile.appId}`;
-        const folder = (0, obsidian_1.normalizePath)(`${this.settings.destinationFolder}/${sanitizePathPart(gameName)}`);
+        const folder = (0, obsidian_1.normalizePath)(`${this.settings.destinationFolder ? `${this.settings.destinationFolder}/` : ''}${sanitizePathPart(gameName)}`);
         await this.ensureVaultFolder(folder);
         const parsed = parseSteamNotes(raw);
         let count = 0;
@@ -132,13 +108,12 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
         return count;
     }
     async getGameName(appId) {
-        var _a, _b, _c;
-        if ((_a = this.metadataCache[appId]) === null || _a === void 0 ? void 0 : _a.name)
+        if (this.metadataCache[appId]?.name)
             return this.metadataCache[appId].name;
         try {
             const response = await (0, obsidian_1.requestUrl)({ url: `https://store.steampowered.com/api/appdetails?appids=${encodeURIComponent(appId)}` });
             const json = response.json;
-            const name = (_c = (_b = json[appId]) === null || _b === void 0 ? void 0 : _b.data) === null || _c === void 0 ? void 0 : _c.name;
+            const name = json[appId]?.data?.name;
             if (name) {
                 this.metadataCache[appId] = { appId, name };
                 return name;
@@ -240,6 +215,14 @@ function extractNotes(value) {
 }
 function htmlToMarkdown(value) {
     return value
+        // Steam Game Notes currently uses [p]...[/p] for hard paragraph breaks.
+        // Keep Obsidian clean; a future serializer can convert Markdown paragraphs
+        // back to Steam markup when push is implemented.
+        .replace(/\[p\]/gi, '')
+        .replace(/\[\/p\]/gi, '\n\n')
+        .replace(/\[br\]/gi, '\n')
+        .replace(/\[b\](.*?)\[\/b\]/gis, '**$1**')
+        .replace(/\[i\](.*?)\[\/i\]/gis, '*$1*')
         .replace(/<br\s*\/?>/gi, '\n')
         .replace(/<\/p>\s*<p>/gi, '\n\n')
         .replace(/<\/?p>/gi, '')
@@ -249,7 +232,9 @@ function htmlToMarkdown(value) {
         .replace(/&nbsp;/g, ' ')
         .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>');
+        .replace(/&gt;/g, '>')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
 }
 function parseValveKeyValues(text) {
     let i = 0;
@@ -311,6 +296,124 @@ function parseValveKeyValues(text) {
     };
     return readObject();
 }
+class SyncActionsModal extends obsidian_1.Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: 'SteamyNotes actions' });
+        contentEl.createEl('p', {
+            text: 'Choose the direction explicitly. SteamyNotes currently never writes to Steam, so Push is disabled until two-way synchronization is implemented and tested.',
+            cls: 'steamynotes-setting-note',
+        });
+        new obsidian_1.Setting(contentEl)
+            .setName('Pull from Steam')
+            .setDesc('Read Steam Game Notes and update the corresponding Obsidian Markdown files.')
+            .addButton(button => button
+            .setButtonText('Pull')
+            .setCta()
+            .onClick(() => {
+            this.close();
+            void this.plugin.importSteamNotes();
+        }));
+        new obsidian_1.Setting(contentEl)
+            .setName('Push to Steam')
+            .setDesc('Not available yet. No Steam files are modified by this prototype.')
+            .addButton(button => button
+            .setButtonText('Coming later')
+            .setDisabled(true));
+        new obsidian_1.Setting(contentEl)
+            .addButton(button => button
+            .setButtonText('Cancel')
+            .onClick(() => this.close()));
+    }
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+class FolderPickerModal extends obsidian_1.SuggestModal {
+    constructor(app, folders, onChoose) {
+        super(app);
+        this.folders = folders;
+        this.onChoose = onChoose;
+        this.setPlaceholder('Search folders in this vault…');
+    }
+    getSuggestions(query) {
+        const q = query.toLowerCase().trim();
+        return this.folders.filter(folder => !q || folder.toLowerCase().includes(q));
+    }
+    renderSuggestion(folder, el) {
+        el.createDiv({ text: folder || 'Vault root' });
+    }
+    onChooseSuggestion(folder) {
+        this.onChoose(folder);
+    }
+}
+class NewFolderModal extends obsidian_1.Modal {
+    constructor(app, plugin, onCreated) {
+        super(app);
+        this.plugin = plugin;
+        this.onCreated = onCreated;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: 'Create Obsidian folder' });
+        contentEl.createEl('p', { text: 'Enter a vault-relative folder path, for example Steam/Notes.' });
+        this.input = contentEl.createEl('input', { type: 'text', placeholder: 'Steam/Notes' });
+        this.input.style.width = '100%';
+        this.input.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter')
+                void this.create();
+        });
+        const buttons = contentEl.createDiv({ cls: 'steamynotes-modal-buttons' });
+        new obsidian_1.ButtonComponent(buttons).setButtonText('Create').setCta().onClick(() => void this.create());
+        new obsidian_1.ButtonComponent(buttons).setButtonText('Cancel').onClick(() => this.close());
+        window.setTimeout(() => this.input?.focus(), 0);
+    }
+    async create() {
+        const value = (0, obsidian_1.normalizePath)((this.input?.value ?? '').trim().replace(/^\/+|\/+$/g, ''));
+        if (!value) {
+            new obsidian_1.Notice('SteamyNotes: enter a folder path.');
+            return;
+        }
+        try {
+            const parts = value.split('/').filter(Boolean);
+            let current = '';
+            for (const part of parts) {
+                current = current ? `${current}/${part}` : part;
+                if (!this.plugin.app.vault.getAbstractFileByPath(current)) {
+                    await this.plugin.app.vault.createFolder(current);
+                }
+            }
+            this.onCreated(value);
+            this.close();
+        }
+        catch (error) {
+            console.error('SteamyNotes: unable to create destination folder', error);
+            new obsidian_1.Notice(`SteamyNotes: unable to create folder. ${String(error)}`);
+        }
+    }
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+function getVaultFolders(app) {
+    const folders = new Set(['']);
+    const walk = (folder) => {
+        for (const child of folder.children) {
+            if (child instanceof obsidian_1.TFolder) {
+                folders.add(child.path);
+                walk(child);
+            }
+        }
+    };
+    walk(app.vault.getRoot());
+    return Array.from(folders).sort((a, b) => a.localeCompare(b));
+}
 class SteamyNotesSettingTab extends obsidian_1.PluginSettingTab {
     constructor(app, plugin) {
         super(app, plugin);
@@ -322,7 +425,7 @@ class SteamyNotesSettingTab extends obsidian_1.PluginSettingTab {
         containerEl.createEl('h2', { text: 'SteamyNotes' });
         new obsidian_1.Setting(containerEl)
             .setName('Steam Game Notes folder')
-            .setDesc('Point this at Steam\\userdata\\<SteamUserID>\\2371090\\remote. The prototype scans files named notes_<gameid>.')
+            .setDesc('Select the Steam Game Notes remote folder. Standard Windows location: C:\\Program Files (x86)\\Steam\\userdata\\<SteamUserID>\\2371090\\remote. If Steam is installed elsewhere, locate the same userdata\\<SteamUserID>\\2371090\\remote structure there. The plugin scans files named notes_<gameid>.')
             .addText(text => text
             .setPlaceholder('C:\\Program Files (x86)\\Steam\\userdata\\12345678\\2371090\\remote')
             .setValue(this.plugin.settings.steamNotesPath)
@@ -351,13 +454,37 @@ class SteamyNotesSettingTab extends obsidian_1.PluginSettingTab {
                 new obsidian_1.Notice('SteamyNotes: could not auto-detect a Steam Game Notes folder.');
             }
         }));
-        new obsidian_1.Setting(containerEl)
+        const destinationSetting = new obsidian_1.Setting(containerEl)
             .setName('Obsidian destination folder')
-            .setDesc('Imported notes will be grouped under this folder, then one folder per Steam game.')
-            .addText(text => text
-            .setPlaceholder('Steam/Notes')
-            .setValue(this.plugin.settings.destinationFolder)
-            .onChange(async (value) => { this.plugin.settings.destinationFolder = value.trim().replace(/^\/+|\/+$/g, ''); await this.plugin.saveSettings(); }));
+            .setDesc('Choose a folder in this vault. Imported notes will be grouped under it, then one folder per Steam game.');
+        destinationSetting.addButton(button => button
+            .setButtonText(this.plugin.settings.destinationFolder || 'Vault root')
+            .setTooltip('Choose an existing folder in the vault')
+            .onClick(() => {
+            const folders = getVaultFolders(this.plugin.app);
+            new FolderPickerModal(this.plugin.app, folders, async (folder) => {
+                this.plugin.settings.destinationFolder = folder;
+                await this.plugin.saveSettings();
+                this.display();
+            }).open();
+        }));
+        destinationSetting.addButton(button => button
+            .setButtonText('New folder…')
+            .onClick(() => {
+            new NewFolderModal(this.plugin.app, this.plugin, async (folder) => {
+                this.plugin.settings.destinationFolder = folder;
+                await this.plugin.saveSettings();
+                this.display();
+            }).open();
+        }));
+        destinationSetting.addButton(button => button
+            .setButtonText('Vault root')
+            .setDisabled(!this.plugin.settings.destinationFolder)
+            .onClick(async () => {
+            this.plugin.settings.destinationFolder = '';
+            await this.plugin.saveSettings();
+            this.display();
+        }));
         new obsidian_1.Setting(containerEl)
             .setName('Resolve game names')
             .setDesc('Use Steam AppID metadata to name Obsidian folders. The AppID remains in frontmatter, so folder renaming does not change the Steam identity.')
@@ -374,15 +501,14 @@ class SteamyNotesSettingTab extends obsidian_1.PluginSettingTab {
     }
 }
 async function browseForFolder() {
-    var _a, _b, _c;
     try {
         const nodeRequire = window.require;
-        const electron = nodeRequire === null || nodeRequire === void 0 ? void 0 : nodeRequire('electron');
-        const paths = (_b = (_a = electron === null || electron === void 0 ? void 0 : electron.dialog) === null || _a === void 0 ? void 0 : _a.showOpenDialogSync) === null || _b === void 0 ? void 0 : _b.call(_a, {
+        const electron = nodeRequire?.('electron');
+        const paths = electron?.dialog?.showOpenDialogSync?.({
             properties: ['openDirectory'],
             title: 'Select Steam Game Notes folder',
         });
-        return (_c = paths === null || paths === void 0 ? void 0 : paths[0]) !== null && _c !== void 0 ? _c : null;
+        return paths?.[0] ?? null;
     }
     catch (error) {
         console.warn('SteamyNotes: native folder picker unavailable', error);
@@ -391,7 +517,6 @@ async function browseForFolder() {
     }
 }
 async function detectSteamNotesPath() {
-    var _a, _b, _c;
     const candidates = [];
     if (process.platform === 'win32') {
         const pf86 = process.env['ProgramFiles(x86)'];
@@ -402,11 +527,11 @@ async function detectSteamNotesPath() {
             candidates.push(path.join(pf, 'Steam'));
     }
     else if (process.platform === 'darwin') {
-        candidates.push(path.join((_a = process.env.HOME) !== null && _a !== void 0 ? _a : '', 'Library/Application Support/Steam'));
+        candidates.push(path.join(process.env.HOME ?? '', 'Library/Application Support/Steam'));
     }
     else {
-        candidates.push(path.join((_b = process.env.HOME) !== null && _b !== void 0 ? _b : '', '.local/share/Steam'));
-        candidates.push(path.join((_c = process.env.HOME) !== null && _c !== void 0 ? _c : '', '.steam/steam'));
+        candidates.push(path.join(process.env.HOME ?? '', '.local/share/Steam'));
+        candidates.push(path.join(process.env.HOME ?? '', '.steam/steam'));
     }
     for (const root of candidates) {
         try {
