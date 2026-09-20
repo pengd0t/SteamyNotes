@@ -44,12 +44,28 @@ const node_crypto_1 = require("node:crypto");
  * fingerprint, so a bump makes the next sync regenerate notes that were not
  * edited in Obsidian.
  */
-const FORMAT_VERSION = 2;
+const FORMAT_VERSION = 3;
 const HISTORY_FOLDER = 'History';
 const NAME_FAILURE_TTL_MS = 24 * 60 * 60 * 1000;
 const ALERT_TIMEOUT_MS = 20000;
 const STARTUP_SYNC_DELAY_MS = 3000;
 const SNAPSHOT_NAME_RE = / - \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z(?: - \d+)?\.md$/;
+/**
+ * File name limits. Windows stops at 260 characters for a whole path (Git for
+ * Windows fails there by default) and most filesystems at 255 bytes per name.
+ * Steam stores the whole first line of a note as its title, so titles are
+ * shortened in FILE NAMES only; the full title stays inside the note.
+ */
+const MAX_NAME_BYTES = 120;
+const MAX_GAME_FOLDER_CHARS = 60;
+const IMAGE_NAME_PART_CHARS = 40;
+const IMAGE_NAME_PART_BYTES = 90;
+const IMAGE_STEM_MAX_CHARS = 100;
+const IMAGE_STEM_MAX_BYTES = 200;
+const MIN_TITLE_LENGTH = 20;
+const MAX_TITLE_LENGTH = 120;
+const IMAGE_SUFFIX_RE = / - (?:Unreferenced )?Image \d+(?: \d+)?$/;
+const HISTORY_STEM_RE = /^(.*?)( - Steam version)?( - \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)( - \d+)?$/;
 
 const DEFAULT_SETTINGS = {
     steamNotesPath: '',
@@ -63,6 +79,7 @@ const DEFAULT_SETTINGS = {
     autoSyncIntervalMinutes: 0,
     recreateDeletedNotes: true,
     includeSourcePath: true,
+    maxTitleLength: 50,
 };
 
 class SteamyNotesPlugin extends obsidian_1.Plugin {
@@ -99,12 +116,27 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
             callback: () => void this.importSteamNotes(false, { force: true }),
         });
         this.addCommand({
+            id: 'push-steam-notes',
+            name: 'Push Obsidian notes to Steam',
+            callback: () => void this.exportSteamNotes(),
+        });
+        this.addCommand({
+            id: 'restore-steam-backups',
+            name: 'Restore Steam notes from SteamyNotes backups',
+            callback: () => void this.restoreSteamBackups(),
+        });
+        this.addCommand({
             id: 'review-held-games',
             name: 'Review games held by shrink protection',
             callback: () => this.openHeldReview(),
         });
+        this.addCommand({
+            id: 'shorten-long-file-names',
+            name: 'Shorten long file names (notes, images, History)',
+            callback: () => void this.shortenLongNames(),
+        });
         // The ribbon deliberately opens an action chooser rather than immediately
-        // writing anything. Push is disabled until two-way sync is implemented.
+        // writing anything, so Pull / Push are explicit choices.
         this.addRibbonIcon('book-open', 'SteamyNotes: Steam notes actions', () => this.openSyncActions());
         this.addSettingTab(new SteamyNotesSettingTab(this.app, this));
         this.app.workspace.onLayoutReady(() => {
@@ -133,6 +165,143 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
     openHeldReview() {
         new HeldReviewModal(this.app, this).open();
     }
+    titleLimit() {
+        return clampTitleLength(this.settings.maxTitleLength);
+    }
+    /**
+     * Renames existing Steam notes, images and History files whose names exceed
+     * the current limit. Uses Obsidian's rename so links to them are updated,
+     * and keeps the sync records pointing at the new names.
+     */
+    async shortenLongNames() {
+        if (this.syncInProgress) {
+            new obsidian_1.Notice('SteamyNotes: a sync is already running. Try again in a moment.');
+            return;
+        }
+        this.syncInProgress = true;
+        const counts = { notes: 0, images: 0, history: 0 };
+        const failures = [];
+        try {
+            const noteStemChars = this.titleLimit() + 5; // "NN - " + title
+            const noteStemBytes = MAX_NAME_BYTES + 5;
+            const historyExtra = 16 + 27 + 4; // " - Steam version", " - <stamp>", " - n"
+            // Renaming an image makes Obsidian rewrite the links inside notes. Remember
+            // which notes are unedited so that rewrite isn't later mistaken for an edit.
+            const unedited = [];
+            for (const state of Object.values(this.syncState)) {
+                for (const record of Object.values(state.notes ?? {})) {
+                    const file = record?.path ? this.app.vault.getAbstractFileByPath(record.path) : null;
+                    if (!(file instanceof obsidian_1.TFile) || !record.writtenHash)
+                        continue;
+                    if (sha1(normalizeForCompare(await this.app.vault.read(file))) === record.writtenHash)
+                        unedited.push(record);
+                }
+            }
+            // Images first, so links inside notes and History are updated by Obsidian.
+            for (const [key, imagePath] of Object.entries(this.imageCache)) {
+                const file = this.app.vault.getAbstractFileByPath(imagePath);
+                if (!(file instanceof obsidian_1.TFile))
+                    continue;
+                const { stem, ext } = splitFileName(file.name);
+                if (!exceedsNameLimit(stem, IMAGE_STEM_MAX_CHARS, IMAGE_STEM_MAX_BYTES))
+                    continue;
+                const shortStem = clipWithSuffix(stem, IMAGE_SUFFIX_RE, IMAGE_STEM_MAX_CHARS, IMAGE_STEM_MAX_BYTES);
+                if (shortStem === stem)
+                    continue;
+                const target = this.freeImagePath(parentFolder(file.path), shortStem, ext);
+                try {
+                    await this.app.fileManager.renameFile(file, target);
+                    this.imageCache[key] = target;
+                    counts.images++;
+                }
+                catch (error) {
+                    failures.push(`${file.name}: ${errorMessage(error)}`);
+                }
+            }
+            // Tracked notes.
+            for (const state of Object.values(this.syncState)) {
+                for (const record of Object.values(state.notes ?? {})) {
+                    if (!record?.path || isSnapshotPath(record.path))
+                        continue;
+                    const file = this.app.vault.getAbstractFileByPath(record.path);
+                    if (!(file instanceof obsidian_1.TFile))
+                        continue;
+                    const { stem, ext } = splitFileName(file.name);
+                    if (!exceedsNameLimit(stem, noteStemChars, noteStemBytes))
+                        continue;
+                    const shortStem = clipName(stem, noteStemChars, noteStemBytes);
+                    if (shortStem === stem)
+                        continue;
+                    const target = this.freeNotePath((0, obsidian_1.normalizePath)(`${parentFolder(file.path)}/${shortStem}${ext}`));
+                    try {
+                        await this.app.fileManager.renameFile(file, target);
+                        record.path = target;
+                        counts.notes++;
+                    }
+                    catch (error) {
+                        failures.push(`${file.name}: ${errorMessage(error)}`);
+                    }
+                }
+            }
+            // History snapshots: shorten the note-name part, keep the label and timestamp.
+            for (const file of this.app.vault.getMarkdownFiles()) {
+                if (!isSnapshotPath(file.path))
+                    continue;
+                const { stem, ext } = splitFileName(file.name);
+                if (!exceedsNameLimit(stem, noteStemChars + historyExtra, noteStemBytes + historyExtra))
+                    continue;
+                const parts = HISTORY_STEM_RE.exec(stem);
+                if (!parts)
+                    continue;
+                const base = clipName(parts[1], noteStemChars, noteStemBytes);
+                let target = '';
+                for (let n = 1;; n++) {
+                    const counter = n === 1 ? (parts[4] ?? '') : ` - ${n}`;
+                    target = (0, obsidian_1.normalizePath)(`${parentFolder(file.path)}/${base}${parts[2] ?? ''}${parts[3]}${counter}${ext}`);
+                    if (!this.app.vault.getAbstractFileByPath(target))
+                        break;
+                }
+                try {
+                    await this.app.fileManager.renameFile(file, target);
+                    counts.history++;
+                }
+                catch (error) {
+                    failures.push(`${file.name}: ${errorMessage(error)}`);
+                }
+            }
+            // Link rewrites by Obsidian are not user edits: re-baseline notes that were unedited.
+            for (const record of unedited) {
+                const file = this.app.vault.getAbstractFileByPath(record.path);
+                if (file instanceof obsidian_1.TFile)
+                    record.writtenHash = sha1(normalizeForCompare(await this.app.vault.read(file)));
+            }
+            await this.saveSettings();
+            const total = counts.notes + counts.images + counts.history;
+            let message = total
+                ? `SteamyNotes: shortened ${counts.notes} note name${counts.notes === 1 ? '' : 's'}, ${counts.images} image name${counts.images === 1 ? '' : 's'} and ${counts.history} History name${counts.history === 1 ? '' : 's'}.`
+                : 'SteamyNotes: no file names needed shortening.';
+            if (failures.length) {
+                message += `\n${failures.length} could not be renamed: ${failures.slice(0, 3).join('; ')}${failures.length > 3 ? '; …' : ''}`;
+                console.error('SteamyNotes rename failures:', failures);
+            }
+            new obsidian_1.Notice(message, failures.length ? ALERT_TIMEOUT_MS : undefined);
+        }
+        catch (error) {
+            console.error('SteamyNotes: shortening file names failed', error);
+            new obsidian_1.Notice(`SteamyNotes: unable to shorten file names. ${errorMessage(error)}`);
+        }
+        finally {
+            this.syncInProgress = false;
+        }
+    }
+    freeImagePath(folder, stem, ext) {
+        const taken = new Set(Object.values(this.imageCache));
+        for (let n = 1;; n++) {
+            const candidate = (0, obsidian_1.normalizePath)(`${folder}/${stem}${n === 1 ? '' : ` ${n}`}${ext}`);
+            if (!taken.has(candidate) && !this.app.vault.getAbstractFileByPath(candidate))
+                return candidate;
+        }
+    }
     /** (Re)arm the interval timer from the current setting. Safe to call repeatedly. */
     restartAutoSync() {
         if (this.autoSyncTimer !== null) {
@@ -158,6 +327,7 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
         const data = (await this.loadData()) ?? {};
         const { metadataCache, imageCache, nameFailures, syncState, ...settings } = data;
         this.settings = Object.assign({}, DEFAULT_SETTINGS, settings);
+        this.settings.maxTitleLength = clampTitleLength(this.settings.maxTitleLength);
         this.metadataCache = metadataCache ?? {};
         this.imageCache = imageCache ?? {};
         this.nameFailures = nameFailures ?? {};
@@ -263,6 +433,277 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
             this.syncInProgress = false;
         }
     }
+
+
+    /**
+     * Restore Steam notes_<AppID> files from the .steamy-backup copies written
+     * immediately before the last successful push. Does not touch the vault.
+     */
+    async restoreSteamBackups() {
+        if (this.syncInProgress) {
+            new obsidian_1.Notice('SteamyNotes: a sync is already running.');
+            return;
+        }
+        const source = this.settings.steamNotesPath.trim();
+        if (!source) {
+            new obsidian_1.Notice('SteamyNotes: set the Steam Game Notes folder in Settings first.');
+            return;
+        }
+        this.syncInProgress = true;
+        try {
+            let entries;
+            try {
+                entries = await fs.readdir(source, { withFileTypes: true });
+            }
+            catch (error) {
+                new obsidian_1.Notice(`SteamyNotes: unable to read Steam notes folder. ${errorMessage(error)}`);
+                return;
+            }
+            const backups = entries
+                .filter(e => e.isFile() && /^notes_\d+\.steamy-backup$/.test(e.name))
+                .map(e => e.name);
+            if (!backups.length) {
+                new obsidian_1.Notice('SteamyNotes: no .steamy-backup files found next to your Steam notes.');
+                return;
+            }
+            let restored = 0;
+            const errors = [];
+            for (const name of backups) {
+                const backupPath = path.join(source, name);
+                const targetPath = path.join(source, name.replace(/\.steamy-backup$/, ''));
+                try {
+                    const raw = await fs.readFile(backupPath, 'utf8');
+                    // Sanity: must still look like a notes document.
+                    const parsed = parseSteamNotes(raw);
+                    if (!parsed.ok) {
+                        errors.push(`${name}: backup is not a recognizable Steam notes file`);
+                        continue;
+                    }
+                    const tmp = `${targetPath}.steamy-restore-tmp`;
+                    await fs.writeFile(tmp, raw, 'utf8');
+                    await fs.rename(tmp, targetPath);
+                    // Invalidate sync state so the next pull re-reads Steam.
+                    const appId = /^notes_(\d+)\.steamy-backup$/.exec(name)?.[1];
+                    if (appId && this.syncState[appId]) {
+                        this.syncState[appId] = {
+                            ...this.syncState[appId],
+                            sourceHash: '',
+                            pending: undefined,
+                        };
+                    }
+                    restored++;
+                }
+                catch (error) {
+                    errors.push(`${name}: ${errorMessage(error)}`);
+                    console.error('SteamyNotes restore failed', name, error);
+                }
+            }
+            await this.saveSettings();
+            const parts = [`${restored} restored`];
+            if (errors.length)
+                parts.push(`${errors.length} failed`);
+            new obsidian_1.Notice(`SteamyNotes restore: ${parts.join(', ')}`, ALERT_TIMEOUT_MS);
+            for (const err of errors.slice(0, 5))
+                new obsidian_1.Notice(`SteamyNotes: ${err}`, ALERT_TIMEOUT_MS);
+        }
+        finally {
+            this.syncInProgress = false;
+        }
+    }
+
+    /**
+     * Push Obsidian edits back into Steam's local notes_<AppID> files.
+     * Only notes that already exist in Steam (matched by steam_note_id) are updated.
+     * New notes created only in Obsidian are not created in Steam in this version.
+     * Images already present in Steam are remapped; brand-new vault images are left as comments.
+     */
+    async exportSteamNotes() {
+        if (this.syncInProgress) {
+            new obsidian_1.Notice('SteamyNotes: a sync is already running.');
+            return;
+        }
+        const source = this.settings.steamNotesPath.trim();
+        if (!source) {
+            new obsidian_1.Notice('SteamyNotes: set the Steam Game Notes folder in Settings first.');
+            return;
+        }
+        this.syncInProgress = true;
+        const totals = { updated: 0, unchanged: 0, skipped: 0, filesWritten: 0, errors: [] };
+        try {
+            let files;
+            try {
+                files = await this.findSteamNoteFiles(source);
+            }
+            catch (error) {
+                new obsidian_1.Notice(`SteamyNotes: unable to scan Steam notes folder. ${errorMessage(error)}`);
+                return;
+            }
+            if (!files.length) {
+                new obsidian_1.Notice('SteamyNotes: no notes_<gameid> files were found in that folder.');
+                return;
+            }
+            const noteIndex = this.buildNoteIndex();
+            for (const steamFile of files) {
+                try {
+                    const part = await this.exportSteamFile(steamFile, noteIndex);
+                    totals.updated += part.updated;
+                    totals.unchanged += part.unchanged;
+                    totals.skipped += part.skipped;
+                    totals.filesWritten += part.filesWritten;
+                    totals.errors.push(...part.errors);
+                }
+                catch (error) {
+                    totals.errors.push(`${steamFile.appId}: ${errorMessage(error)}`);
+                    console.error('SteamyNotes push failed', steamFile, error);
+                }
+            }
+            await this.saveSettings();
+            const parts = [];
+            if (totals.updated)
+                parts.push(`${totals.updated} note${totals.updated === 1 ? '' : 's'} updated`);
+            if (totals.unchanged)
+                parts.push(`${totals.unchanged} unchanged`);
+            if (totals.skipped)
+                parts.push(`${totals.skipped} skipped`);
+            if (totals.filesWritten)
+                parts.push(`${totals.filesWritten} file${totals.filesWritten === 1 ? '' : 's'} written`);
+            if (totals.errors.length)
+                parts.push(`${totals.errors.length} failed`);
+            const summary = parts.length ? parts.join(', ') : 'nothing to push';
+            new obsidian_1.Notice(`SteamyNotes push: ${summary}`, ALERT_TIMEOUT_MS);
+            for (const err of totals.errors.slice(0, 5))
+                new obsidian_1.Notice(`SteamyNotes: ${err}`, ALERT_TIMEOUT_MS);
+        }
+        finally {
+            this.syncInProgress = false;
+        }
+    }
+    async exportSteamFile(steamFile, noteIndex) {
+        const appId = steamFile.appId;
+        const result = { updated: 0, unchanged: 0, skipped: 0, filesWritten: 0, errors: [] };
+        const raw = await fs.readFile(steamFile.filePath, 'utf8');
+        let root;
+        try {
+            root = JSON.parse(raw.replace(/^\uFEFF/, '').replace(/\0/g, ''));
+        }
+        catch (_) {
+            result.errors.push(`${appId}: Steam notes file is not JSON; push currently requires the JSON format Steam writes.`);
+            return result;
+        }
+        if (!root || typeof root !== 'object' || !Array.isArray(root.notes)) {
+            result.errors.push(`${appId}: unrecognized Steam notes structure.`);
+            return result;
+        }
+        const byId = noteIndex.get(appId) ?? new Map();
+        const reverseImageMap = this.buildReverseImageMap(appId);
+        let changed = false;
+        const nowSec = Math.floor(Date.now() / 1000);
+        const previous = this.syncState[appId];
+        const records = { ...(previous?.notes ?? {}) };
+        for (let i = 0; i < root.notes.length; i++) {
+            const obj = root.notes[i];
+            if (!obj || typeof obj !== 'object')
+                continue;
+            let id;
+            if (typeof obj.id === 'string')
+                id = obj.id;
+            else if (typeof obj.id === 'number')
+                id = String(obj.id);
+            else
+                id = `index-${i + 1}`;
+            const vaultPath = byId.get(id);
+            if (!vaultPath) {
+                result.skipped++;
+                continue;
+            }
+            const file = this.app.vault.getAbstractFileByPath(vaultPath);
+            if (!(file instanceof obsidian_1.TFile)) {
+                result.skipped++;
+                continue;
+            }
+            let markdown;
+            try {
+                markdown = await this.app.vault.read(file);
+            }
+            catch (error) {
+                result.errors.push(`${appId}/${id}: ${errorMessage(error)}`);
+                continue;
+            }
+            const parsed = parseVaultNote(markdown);
+            const steamBody = markdownToSteamBody(parsed.body, reverseImageMap, appId);
+            const oldTitle = typeof obj.title === 'string' ? obj.title : '';
+            const oldContent = typeof obj.content === 'string' ? obj.content : '';
+            if (oldTitle === parsed.title && oldContent === steamBody) {
+                result.unchanged++;
+                continue;
+            }
+            obj.title = parsed.title;
+            obj.content = steamBody;
+            obj.time_modified = nowSec;
+            if (typeof obj.time_created !== 'number')
+                obj.time_created = nowSec;
+            changed = true;
+            result.updated++;
+            // Refresh local sync state so the next pull does not treat this as a Steam-side change.
+            const steamHash = hashSteamNote({ title: parsed.title, body: steamBody });
+            const writtenHash = sha1(normalizeForCompare(markdown));
+            records[id] = {
+                path: vaultPath,
+                steamHash,
+                writtenHash,
+                steamModified: nowSec,
+            };
+        }
+        if (!changed)
+            return result;
+        // Backup the previous Steam file next to itself, then write JSON.
+        try {
+            const backupPath = `${steamFile.filePath}.steamy-backup`;
+            await fs.writeFile(backupPath, raw, 'utf8');
+        }
+        catch (error) {
+            console.warn('SteamyNotes: unable to write Steam backup', steamFile.filePath, error);
+        }
+        const out = JSON.stringify(root, null, 2) + '\n';
+        const tmp = `${steamFile.filePath}.steamy-tmp`;
+        await fs.writeFile(tmp, out, 'utf8');
+        await fs.rename(tmp, steamFile.filePath);
+        result.filesWritten = 1;
+        this.syncState[appId] = {
+            ...(previous ?? emptyState()),
+            sourceHash: sha1(out),
+            fingerprint: this.settingsFingerprint(),
+            noteCount: root.notes.length,
+            noteIds: root.notes.map((n, idx) => {
+                if (n && typeof n === 'object') {
+                    if (typeof n.id === 'string')
+                        return n.id;
+                    if (typeof n.id === 'number')
+                        return String(n.id);
+                }
+                return `index-${idx + 1}`;
+            }),
+            notes: records,
+            syncedAt: new Date().toISOString(),
+            pending: undefined,
+        };
+        return result;
+    }
+    /** Invert imageCache entries for this appId: vault path -> Steam filename. */
+    buildReverseImageMap(appId) {
+        const map = new Map();
+        const prefix = `${appId}:`;
+        for (const [key, vaultPath] of Object.entries(this.imageCache)) {
+            if (!key.startsWith(prefix) || !vaultPath)
+                continue;
+            const filename = key.slice(prefix.length);
+            map.set(vaultPath.replace(/\\/g, '/'), filename);
+            // Also key by basename for looser matching.
+            map.set(path.posix.basename(vaultPath.replace(/\\/g, '/')), filename);
+        }
+        return map;
+    }
+
     /** Applies Steam's current version for a game that was held for review. */
     async acceptHeldGame(appId) {
         if (this.syncInProgress) {
@@ -484,7 +925,7 @@ async canSkipUnchanged(previous, sourceHash, gameName, fingerprint) {
                 return result;
             }
         }
-        const folder = (0, obsidian_1.normalizePath)(`${this.settings.destinationFolder ? `${this.settings.destinationFolder}/` : ''}${sanitizePathPart(gameName)}`);
+        const folder = (0, obsidian_1.normalizePath)(`${this.settings.destinationFolder ? `${this.settings.destinationFolder}/` : ''}${clipName(gameName, MAX_GAME_FOLDER_CHARS)}`);
         await this.ensureVaultFolder(folder);
         const imageRoot = path.join(path.dirname(steamFile.filePath), `notes_${appId}_images`);
         const imageDestination = this.settings.imageDestinationFolder.trim()
@@ -552,7 +993,7 @@ async canSkipUnchanged(previous, sourceHash, gameName, fingerprint) {
         if (!file) {
             if (record && !this.settings.recreateDeletedNotes)
                 return { kind: 'skipped', record };
-            const preferred = record?.path && !isSnapshotPath(record.path) ? record.path : `${folder}/${defaultNoteFileName(note)}`;
+            const preferred = record?.path && !isSnapshotPath(record.path) ? record.path : `${folder}/${defaultNoteFileName(note, this.titleLimit())}`;
             const target = this.freeNotePath((0, obsidian_1.normalizePath)(preferred));
             await this.ensureVaultFolder(parentFolder(target));
             await this.app.vault.create(target, desired);
@@ -630,7 +1071,7 @@ async canSkipUnchanged(previous, sourceHash, gameName, fingerprint) {
         await this.ensureVaultFolder(historyFolder);
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
         const label = kind === 'steam-version' ? ' - Steam version' : '';
-        const base = `${sanitizePathPart(fileName.replace(/\.md$/i, ''))}${label}`;
+        const base = `${clipName(fileName.replace(/\.md$/i, ''), this.titleLimit() + 5, MAX_NAME_BYTES + 5)}${label}`;
         let target = (0, obsidian_1.normalizePath)(`${historyFolder}/${base} - ${stamp}.md`);
         let n = 2;
         while (this.app.vault.getAbstractFileByPath(target)) {
@@ -682,11 +1123,11 @@ async canSkipUnchanged(previous, sourceHash, gameName, fingerprint) {
                     const info = imageInfo.get(entry.name);
                     let baseName;
                     if (info) {
-                        baseName = `${sanitizePathPart(gameName)} - ${sanitizePathPart(info.title)} - Image ${String(info.number).padStart(2, '0')}`;
+                        baseName = `${clipName(gameName, IMAGE_NAME_PART_CHARS, IMAGE_NAME_PART_BYTES)} - ${clipName(info.title, IMAGE_NAME_PART_CHARS, IMAGE_NAME_PART_BYTES)} - Image ${String(info.number).padStart(2, '0')}`;
                     }
                     else {
                         unreferencedNumber++;
-                        baseName = `${sanitizePathPart(gameName)} - Unreferenced Image ${String(unreferencedNumber).padStart(2, '0')}`;
+                        baseName = `${clipName(gameName, IMAGE_NAME_PART_CHARS, IMAGE_NAME_PART_BYTES)} - Unreferenced Image ${String(unreferencedNumber).padStart(2, '0')}`;
                     }
                     target = await this.uniqueImageTarget(imageDestination, baseName, path.extname(entry.name), usedTargets, cachedTargets);
                     this.imageCache[cacheKey] = target;
@@ -818,8 +1259,53 @@ function parentFolder(filePath) {
     const i = filePath.lastIndexOf('/');
     return i === -1 ? '' : filePath.slice(0, i);
 }
-function defaultNoteFileName(note) {
-    return `${String(note.index).padStart(2, '0')} - ${sanitizePathPart(note.title || `Steam Note ${note.index}`)}.md`;
+function defaultNoteFileName(note, maxTitleChars = DEFAULT_SETTINGS.maxTitleLength) {
+    return `${String(note.index).padStart(2, '0')} - ${clipName(note.title || `Steam Note ${note.index}`, maxTitleChars)}.md`;
+}
+function byteLength(text) {
+    return new TextEncoder().encode(text).length;
+}
+function clampTitleLength(value) {
+    const n = Math.floor(Number(value));
+    if (!Number.isFinite(n) || n <= 0)
+        return DEFAULT_SETTINGS.maxTitleLength;
+    return Math.min(MAX_TITLE_LENGTH, Math.max(MIN_TITLE_LENGTH, n));
+}
+/**
+ * Makes text safe and short enough for one file or folder name: illegal and
+ * control characters are replaced, the length is capped in characters AND
+ * bytes (so CJK titles stay under the 255-byte limit), and the cut prefers a
+ * word boundary. Text that already fits is returned exactly as
+ * sanitizePathPart would return it, so existing names never change.
+ */
+function clipName(value, maxChars, maxBytes = MAX_NAME_BYTES) {
+    const cleaned = sanitizePathPart(String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' '));
+    if (Array.from(cleaned).length <= maxChars && byteLength(cleaned) <= maxBytes)
+        return cleaned;
+    const chars = Array.from(cleaned.replace(/\s+/g, ' ')).slice(0, maxChars);
+    while (chars.length > 1 && byteLength(chars.join('')) > maxBytes)
+        chars.pop();
+    let clipped = chars.join('');
+    const space = clipped.lastIndexOf(' ');
+    if (space >= clipped.length * 0.6)
+        clipped = clipped.slice(0, space);
+    return sanitizePathPart(clipped.replace(/[\s.\-_]+$/, ''));
+}
+function exceedsNameLimit(text, maxChars, maxBytes) {
+    return Array.from(text).length > maxChars || byteLength(text) > maxBytes;
+}
+function splitFileName(name) {
+    const i = name.lastIndexOf('.');
+    return i <= 0 ? { stem: name, ext: '' } : { stem: name.slice(0, i), ext: name.slice(i) };
+}
+/** Shortens the head of a name but keeps a recognizable trailing part (e.g. " - Image 01"). */
+function clipWithSuffix(stem, suffixRe, maxChars, maxBytes) {
+    const match = suffixRe.exec(stem);
+    const suffix = match ? match[0] : '';
+    const head = match ? stem.slice(0, match.index) : stem;
+    const room = Math.max(10, maxChars - Array.from(suffix).length);
+    const roomBytes = Math.max(30, maxBytes - byteLength(suffix));
+    return `${clipName(head, room, roomBytes)}${suffix}`;
 }
 function isSnapshotPath(filePath) {
     const parts = filePath.split('/');
@@ -962,26 +1448,195 @@ function steamBodyToMarkdown(value, imageMap) {
     });
     return htmlToMarkdown(body);
 }
+/**
+ * Steam Notes body -> Markdown. Order matters: block structures first, then inline.
+ * Unknown tags are left as-is so a later push can still round-trip them.
+ */
 function htmlToMarkdown(value) {
-    return value
-        .replace(/\[p\]/gi, '')
-        .replace(/\[\/p\]/gi, '\n\n')
-        .replace(/\[br\]/gi, '\n')
-        .replace(/\[b\](.*?)\[\/b\]/gis, '**$1**')
-        .replace(/\[i\](.*?)\[\/i\]/gis, '*$1*')
-        .replace(/<br\s*\/?>(?=\S)/gi, '\n')
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<\/?p>/gi, '')
-        .replace(/<strong>(.*?)<\/strong>/gis, '**$1**')
-        .replace(/<em>(.*?)<\/em>/gis, '*$1*')
-        .replace(/<[^>]+>/g, '')
-        .replace(/&nbsp;/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
+    let body = value ?? '';
+    // Paragraphs / breaks
+    body = body.replace(/\[p\]/gi, '');
+    body = body.replace(/\[\/p\]/gi, '\n\n');
+    body = body.replace(/\[br\]/gi, '\n');
+    // Headings
+    body = body.replace(/\[h1\](.*?)\[\/h1\]/gis, '# $1\n\n');
+    body = body.replace(/\[h2\](.*?)\[\/h2\]/gis, '## $1\n\n');
+    body = body.replace(/\[h3\](.*?)\[\/h3\]/gis, '### $1\n\n');
+    body = body.replace(/\[h4\](.*?)\[\/h4\]/gis, '#### $1\n\n');
+    body = body.replace(/\[h5\](.*?)\[\/h5\]/gis, '##### $1\n\n');
+    body = body.replace(/\[h6\](.*?)\[\/h6\]/gis, '###### $1\n\n');
+    // Horizontal rule
+    body = body.replace(/\[hr\]\s*\[\/hr\]/gi, '\n---\n');
+    body = body.replace(/\[hr\s*\/?\]/gi, '\n---\n');
+    // Code blocks / inline code ([code] and legacy [c])
+    body = body.replace(/\[code\]([\s\S]*?)\[\/code\]/gis, (_m, code) => {
+        const inner = String(code).replace(/\[br\]/gi, '\n').trimEnd();
+        if (inner.includes('\n'))
+            return `\n\`\`\`\n${inner}\n\`\`\`\n`;
+        return `\`${inner}\``;
+    });
+    body = body.replace(/\[c\](.*?)\[\/c\]/gis, '`$1`');
+    // Lists: [list] / [olist] with [*] items
+    body = body.replace(/\[list\]([\s\S]*?)\[\/list\]/gis, (_m, inner) => {
+        const items = String(inner)
+            .split(/\[\*\]/)
+            .map(s => s.replace(/\[\/?\*\]/g, '').trim())
+            .filter(Boolean)
+            .map(s => `- ${s}`);
+        return items.length ? `\n${items.join('\n')}\n\n` : '';
+    });
+    body = body.replace(/\[olist\]([\s\S]*?)\[\/olist\]/gis, (_m, inner) => {
+        const items = String(inner)
+            .split(/\[\*\]/)
+            .map(s => s.replace(/\[\/?\*\]/g, '').trim())
+            .filter(Boolean)
+            .map((s, i) => `${i + 1}. ${s}`);
+        return items.length ? `\n${items.join('\n')}\n\n` : '';
+    });
+    // Quotes
+    body = body.replace(/\[quote(?:=[^\]]*)?\]([\s\S]*?)\[\/quote\]/gis, (_m, inner) => {
+        const lines = String(inner).trim().split('\n').map(l => `> ${l}`).join('\n');
+        return `\n${lines}\n\n`;
+    });
+    // Links: [url="href"]text[/url] or [url=href]text[/url] or [url]href[/url]
+    body = body.replace(/\[url\s*=\s*"([^"]+)"\s*\](.*?)\[\/url\]/gis, '[$2]($1)');
+    body = body.replace(/\[url\s*=\s*([^\]]+)\](.*?)\[\/url\]/gis, '[$2]($1)');
+    body = body.replace(/\[url\](.*?)\[\/url\]/gis, '[$1]($1)');
+    // Inline emphasis
+    body = body.replace(/\[b\](.*?)\[\/b\]/gis, '**$1**');
+    body = body.replace(/\[i\](.*?)\[\/i\]/gis, '*$1*');
+    body = body.replace(/\[u\](.*?)\[\/u\]/gis, '$1'); // Markdown has no underline; keep text
+    body = body.replace(/\[strike\](.*?)\[\/strike\]/gis, '~~$1~~');
+    body = body.replace(/\[spoiler\](.*?)\[\/spoiler\]/gis, '$1');
+    // Leftover HTML entities / tags sometimes present in older notes
+    body = body.replace(/<br\s*\/?>(?=\S)/gi, '\n');
+    body = body.replace(/<br\s*\/?>/gi, '\n');
+    body = body.replace(/<\/?p>/gi, '');
+    body = body.replace(/<strong>(.*?)<\/strong>/gis, '**$1**');
+    body = body.replace(/<em>(.*?)<\/em>/gis, '*$1*');
+    body = body.replace(/<[^>]+>/g, '');
+    body = body.replace(/&nbsp;/g, ' ');
+    body = body.replace(/&amp;/g, '&');
+    body = body.replace(/&lt;/g, '<');
+    body = body.replace(/&gt;/g, '>');
+    body = body.replace(/\n{3,}/g, '\n\n');
+    return body.trim();
 }
+
+/**
+ * Convert Obsidian Markdown back into Steam Notes body BBCode.
+ * Residual BBCode tags are protected so Markdown emphasis cannot corrupt [*], [i], etc.
+ * @param {string} markdown
+ * @param {Map<string,string>} reverseImageMap vaultPath|basename -> steam src (filename or relative path)
+ * @param {string} [appId] used to build notes_<appId>_images/ prefix for cloudimg when needed
+ */
+function markdownToSteamBody(markdown, reverseImageMap, appId = '') {
+    let body = (markdown ?? '').replace(/\r\n/g, '\n').trim();
+    const protectedChunks = [];
+    const protect = (chunk) => {
+        const idx = protectedChunks.length;
+        protectedChunks.push(chunk);
+        return `\u0000BB${idx}\u0000`;
+    };
+
+    // 1) Images first (wiki then standard Markdown)
+    body = body.replace(/!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g, (_m, link) => {
+        const key = String(link).replace(/\\/g, '/').trim();
+        let src = reverseImageMap.get(key) || reverseImageMap.get(path.posix.basename(key));
+        if (!src)
+            return protect(`<!-- Steam image not pushed (no mapping): ${key} -->`);
+        if (appId && !/[\\/]/.test(src))
+            src = `notes_${appId}_images/${src}`;
+        return protect(`[cloudimg src="${src}"][/cloudimg]`);
+    });
+    body = body.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, _alt, imgSrc) => {
+        const key = String(imgSrc).replace(/\\/g, '/').trim();
+        let src = reverseImageMap.get(key) || reverseImageMap.get(path.posix.basename(key));
+        if (!src)
+            return protect(`<!-- Steam image not pushed (no mapping): ${key} -->`);
+        if (appId && !/[\\/]/.test(src))
+            src = `notes_${appId}_images/${src}`;
+        return protect(`[cloudimg src="${src}"][/cloudimg]`);
+    });
+
+    // 2) Markdown links BEFORE generic [tag] protection (otherwise [label] is swallowed)
+    body = body.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, href) => protect(`[url="${href}"]${label}[/url]`));
+
+    // 3) Fenced / inline code
+    body = body.replace(/```[\w]*\n([\s\S]*?)```/g, (_m, code) => protect(`[code]\n${code.replace(/\n$/, '')}\n[/code]`));
+    body = body.replace(/`([^`\n]+)`/g, (_m, code) => protect(`[code]${code}[/code]`));
+
+    // 4) Protect any remaining BBCode-like tags (from incomplete pulls or prior steps)
+    body = body.replace(/\[[^\]]+\]/g, (tag) => protect(tag));
+
+    // Drop import-failure comments that were protected as placeholders
+    // (comments themselves were protected above when emitted)
+
+    // 5) Headings
+    body = body.replace(/^######\s+(.+)$/gm, '[h3]$1[/h3]');
+    body = body.replace(/^#####\s+(.+)$/gm, '[h3]$1[/h3]');
+    body = body.replace(/^####\s+(.+)$/gm, '[h3]$1[/h3]');
+    body = body.replace(/^###\s+(.+)$/gm, '[h3]$1[/h3]');
+    body = body.replace(/^##\s+(.+)$/gm, '[h2]$1[/h2]');
+    body = body.replace(/^#\s+(.+)$/gm, '[h1]$1[/h1]');
+    // Horizontal rules
+    body = body.replace(/^(?:-{3,}|\*{3,}|_{3,})\s*$/gm, '[hr][/hr]');
+    // Bold / italic / strike
+    body = body.replace(/\*\*\*(.+?)\*\*\*/gs, '[b][i]$1[/i][/b]');
+    body = body.replace(/___(.+?)___/gs, '[b][i]$1[/i][/b]');
+    body = body.replace(/\*\*(.+?)\*\*/gs, '[b]$1[/b]');
+    body = body.replace(/__(.+?)__/gs, '[b]$1[/b]');
+    body = body.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/gs, '[i]$1[/i]');
+    body = body.replace(/(?<!_)_(?!_)(.+?)(?<!_)_(?!_)/gs, '[i]$1[/i]');
+    body = body.replace(/~~(.+?)~~/gs, '[strike]$1[/strike]');
+    // Unordered lists
+    body = body.replace(/(?:^|\n)((?:[-*+]\s+.+(?:\n|$))+)/g, (block) => {
+        const items = block.trim().split('\n').map(line => line.replace(/^[-*+]\s+/, '[*]')).join('');
+        return protect(`[list]${items}[/list]`);
+    });
+    // Ordered lists
+    body = body.replace(/(?:^|\n)((?:\d+\.\s+.+(?:\n|$))+)/g, (block) => {
+        const items = block.trim().split('\n').map(line => line.replace(/^\d+\.\s+/, '[*]')).join('');
+        return protect(`[olist]${items}[/olist]`);
+    });
+    // Blockquotes
+    body = body.replace(/(?:^|\n)((?:>\s?.+(?:\n|$))+)/g, (block) => {
+        const inner = block.trim().split('\n').map(line => line.replace(/^>\s?/, '')).join('\n');
+        return protect(`[quote]${inner}[/quote]`);
+    });
+
+    // 6) Restore protected chunks
+    body = body.replace(/\u0000BB(\d+)\u0000/g, (_m, n) => protectedChunks[Number(n)] ?? '');
+    // Strip residual HTML comments (unmapped images)
+    body = body.replace(/<!--[\s\S]*?-->/g, '');
+
+    // 7) One [p] per visual line when content is plain / inline-only.
+    const hasBlockBb = /\[(?:p|list|olist|h[1-6]|code|quote|hr|table)\b/i.test(body);
+    if (!hasBlockBb) {
+        const paragraphs = body.split(/\n+/).map(p => p.trim()).filter(Boolean);
+        body = paragraphs.map(p => `[p]${p}[/p]`).join('');
+    }
+    else {
+        body = body.replace(/\n{3,}/g, '\n\n').trim();
+    }
+    return body;
+}
+
+/** Split a vault note into title (from first H1 or frontmatter) and body (everything after frontmatter + title). */
+function parseVaultNote(markdown) {
+    let text = (markdown ?? '').replace(/\r\n/g, '\n');
+    // Strip YAML frontmatter
+    text = text.replace(/^---\n[\s\S]*?\n---\n?/, '');
+    text = text.trim();
+    let title = 'Untitled';
+    const h1 = /^#\s+(.+)\n?/.exec(text);
+    if (h1) {
+        title = h1[1].trim();
+        text = text.slice(h1[0].length).trim();
+    }
+    return { title, body: text };
+}
+
 
 function parseValveKeyValues(text) {
     let i = 0;
@@ -1053,7 +1708,7 @@ class SyncActionsModal extends obsidian_1.Modal {
         contentEl.empty();
         contentEl.createEl('h2', { text: 'SteamyNotes actions' });
         contentEl.createEl('p', {
-            text: 'Choose the direction explicitly. SteamyNotes currently never writes to Steam, so Push is disabled until two-way synchronization is implemented and tested.',
+            text: 'Choose the direction explicitly. Push writes Obsidian edits back into Steam\'s local notes files. Close the game and the Steam Notes editor before pushing.',
             cls: 'steamynotes-setting-note',
         });
         new obsidian_1.Setting(contentEl)
@@ -1090,10 +1745,24 @@ class SyncActionsModal extends obsidian_1.Modal {
         }
         new obsidian_1.Setting(contentEl)
             .setName('Push to Steam')
-            .setDesc('Not available yet. No Steam files are modified by this prototype.')
+            .setDesc('Write Obsidian edits back to Steam\'s local notes_<AppID> files. Close any running game and the Steam Notes editor first — Steam can overwrite local files when it saves.')
             .addButton(button => button
-            .setButtonText('Coming later')
-            .setDisabled(true));
+            .setButtonText('Push')
+            .setWarning()
+            .onClick(() => {
+            this.close();
+            void this.plugin.exportSteamNotes();
+        }));
+        new obsidian_1.Setting(contentEl)
+            .setName('Restore from backup')
+            .setDesc('Replace Steam notes_<AppID> files with the .steamy-backup copies written just before the last push. Use this if a push left a note unreadable in Steam.')
+            .addButton(button => button
+            .setButtonText('Restore')
+            .setWarning()
+            .onClick(() => {
+            this.close();
+            void this.plugin.restoreSteamBackups();
+        }));
         new obsidian_1.Setting(contentEl)
             .addButton(button => button
             .setButtonText('Cancel')
@@ -1379,6 +2048,22 @@ class SteamyNotesSettingTab extends obsidian_1.PluginSettingTab {
             await this.plugin.saveSettings();
             this.plugin.scheduleAutoSyncRestart();
         }));
+        new obsidian_1.Setting(containerEl)
+            .setName('Maximum file name length')
+            .setDesc('Longest note title, in characters, used in note, image and History file names. Steam keeps the whole first line of a note as its title, so long ones are shortened in the file name only and the note keeps the full text. This keeps paths inside Windows and Git limits. Default 50; allowed 20 to 120. The button applies the limit to files that already exist.')
+            .addText(text => text
+            .setPlaceholder('50')
+            .setValue(String(this.plugin.settings.maxTitleLength))
+            .onChange(async (value) => {
+            const n = Number(value);
+            if (!Number.isFinite(n) || n <= 0)
+                return; // ignore while the user is typing
+            this.plugin.settings.maxTitleLength = clampTitleLength(n);
+            await this.plugin.saveSettings();
+        }))
+            .addButton(button => button
+            .setButtonText('Shorten existing names')
+            .onClick(() => void this.plugin.shortenLongNames()));
         new obsidian_1.Setting(containerEl)
             .setName('Recreate deleted notes')
             .setDesc('If you delete an imported note from your vault, recreate it on the next sync while it still exists in Steam. Turn off to leave deleted notes deleted.')
