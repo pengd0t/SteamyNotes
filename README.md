@@ -257,7 +257,7 @@ Plugin is desktop-only (needs the Steam install). Imported Markdown can sync to 
 - [x] Preserve Obsidian edits on pull (conflict / History handling)
 - [x] Wider formatting conversion (lists, links, headings, code, …)
 - [x] Backup before push + restore action
-- [ ] Community Plugins listing
+- [x] Community Plugins listing
 - [ ] Create brand-new notes on the Steam side from Obsidian-only files
 - [ ] Upload new images into Steam’s `notes_*_images` folder
 - [ ] Multi-account support
