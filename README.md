@@ -1,6 +1,6 @@
 # SteamyNotes
 
-Bring the notes you take in Steam's in-game overlay into Obsidian. Organized by game. Images included, and then push edits back. 
+Bring the notes you take in Steam's in-game overlay into Obsidian. Organized by game. Images included.  And then push edits back. 
 
 ## Description
 
