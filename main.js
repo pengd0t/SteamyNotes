@@ -384,18 +384,49 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
         }
         return index;
     }
-    canSkipUnchanged(previous, sourceHash, gameName, fingerprint) {
+
+async canSkipUnchanged(previous, sourceHash, gameName, fingerprint) {
         if (!previous || previous.pending)
             return false;
         if (previous.sourceHash !== sourceHash || previous.fingerprint !== fingerprint || previous.gameName !== gameName)
             return false;
-        // The hash is an optimization, not permission to assume the vault is intact.
+
+        // If deleted-note recreation is disabled, the unchanged-source
+        // fast path can still safely skip the scan. The user has explicitly
+        // chosen not to recreate missing notes.
         if (!this.settings.recreateDeletedNotes)
             return true;
-        return previous.noteIds.every(id => {
-            const record = previous.notes[id];
-            return !!record && !!this.app.vault.getAbstractFileByPath(record.path);
-        });
+
+        // The source file is unchanged, but the vault may have changed.
+        // Check the notes that we previously wrote. If any note has been
+        // edited in Obsidian, return false so syncNote() can apply the
+        // three-way comparison and preserve the local edit.
+        for (const id of previous.noteIds) {
+            const record = previous.notes?.[id];
+            if (!record)
+                return false;
+
+            const file = this.app.vault.getAbstractFileByPath(record.path);
+            if (!(file instanceof obsidian_1.TFile))
+                return false;
+
+            if (!record.writtenHash)
+                return false;
+
+            let current;
+            try {
+                current = await this.app.vault.read(file);
+            }
+            catch (_) {
+                return false;
+            }
+
+            const currentHash = sha1(normalizeForCompare(current));
+            if (currentHash !== record.writtenHash)
+                return false;
+        }
+
+        return true;
     }
     /** Decides whether Steam's file looks unsafe to apply. Returns null when it is fine. */
     evaluateHold(previous, parsed) {
@@ -437,7 +468,7 @@ class SteamyNotesPlugin extends obsidian_1.Plugin {
             result.heldCount = 1;
             return result;
         }
-        if (!ctx.force && !ctx.accept && this.canSkipUnchanged(previous, sourceHash, gameName, ctx.fingerprint)) {
+        if (!ctx.force && !ctx.accept && await this.canSkipUnchanged(previous, sourceHash, gameName, ctx.fingerprint)) {
             result.checked = previous.noteCount;
             result.unchanged = previous.noteCount;
             return result;
@@ -797,8 +828,10 @@ function isSnapshotPath(filePath) {
     return parts[parts.length - 2] === HISTORY_FOLDER && SNAPSHOT_NAME_RE.test(parts[parts.length - 1]);
 }
 function hashSteamNote(note) {
-    return sha1(JSON.stringify([note.title, note.body, note.timeCreated ?? null, note.timeModified ?? null]));
-}
+        // steamHash represents Steam note content, not volatile metadata.
+        // The modification timestamp is stored separately as steamModified.
+        return sha1(JSON.stringify([note.title, note.body]));
+    }
 /** Text used to decide whether a note was edited: ignores the volatile steam_source line and CRLF. */
 function normalizeForCompare(markdown) {
     return markdown
