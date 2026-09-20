@@ -1,9 +1,9 @@
 {
   "id": "steamynotes",
   "name": "SteamyNotes",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.7.2",
-  "description": "Import Steam Overlay Game Notes into Obsidian and push edits back to Steam. Organized by game, with images.",
+  "description": "Import Steam Overlay Game Notes into your markdown notes and then push edits back to Steam. Organized by game, with images.",
   "author": "pengd0t",
   "authorUrl": "https://github.com/pengd0t",
   "isDesktopOnly": true
